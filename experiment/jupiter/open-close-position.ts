@@ -9,7 +9,9 @@
 
 import {
   AnchorProvider,
-  Wallet
+  BN,
+  Program,
+  Wallet,
 } from "@coral-xyz/anchor";
 import {
   createAssociatedTokenAccountIdempotentInstruction,
@@ -20,53 +22,57 @@ import {
 } from "@solana/spl-token";
 import {
   ComputeBudgetProgram,
+  Connection,
+  Keypair,
   PublicKey,
   SystemProgram,
   TransactionMessage,
   VersionedTransaction
 } from "@solana/web3.js";
 import "dotenv/config";
-import { JUPITER_PERPETUALS_PROGRAM } from "./constants.ts";
-import { connection, loadKeypair } from "./utils.ts";
-import { BN } from "bn.js";
+import { generatePositionPda, generatePositionRequestPda } from "./examples/generate-position-and-position-request-pda";
+import {
+  CUSTODY_PUBKEY,
+  JUPITER_PERPETUALS_PROGRAM_ID,
+  JLP_POOL_ACCOUNT_PUBKEY
+} from "./constants";
+import { MAINNET_RPC_URL, loadKeypair } from "./utils";
+import IDL from "../idl/jupiter-perpetuals-idl-json.json";
+import { Perpetuals } from "../idl/jupiter-perpetuals-idl";
 // ─────────────────────────────────────────────────────────────────────────
-
 
 const keypair = loadKeypair();
-const PROVIDER = new AnchorProvider(connection, new Wallet(keypair), {
-  commitment: "confirmed",
-});
 
-// Program + pool IDs
-const PERPS_ID = new PublicKey("PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu");
-const POOL_ID  = new PublicKey("5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq");
+const connection = new Connection(
+  MAINNET_RPC_URL
+);
 
-// Custodies (SOL only here – add the rest if you want)
-const SOL_CUSTODY = new PublicKey("7xS2gz2bTp3fwCC7knJvUWTEU9Tycczu6VhJYKgi1wdz");
+const PROGRAM = new Program<Perpetuals>(
+  IDL as any,
+  JUPITER_PERPETUALS_PROGRAM_ID,
+  new AnchorProvider(connection, new Wallet(keypair), {
+    commitment: "confirmed",
+  })
+);
 
+// Jupiter Perpetuals State
+const perpetuals = PublicKey.findProgramAddressSync(
+  [Buffer.from("perpetuals")],
+  JUPITER_PERPETUALS_PROGRAM_ID
+)[0];
 
+const COLLATERAL_USDC_CUSTODY = new PublicKey(CUSTODY_PUBKEY.USDC);
+const CUSTODY = new PublicKey(CUSTODY_PUBKEY.BTC);
 
-const PROGRAM = JUPITER_PERPETUALS_PROGRAM;
+// choose which token you want back; here we redeem as USDC
+const mintUSDC = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC mint
 
-// ─────────────────────────────────────────────────────────────────────────
-//  PDA helpers (unchanged from example repo)                              ─
-function generatePositionPda(owner: PublicKey, custody: PublicKey) {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from("position"), owner.toBuffer(), custody.toBuffer()],
-    PERPS_ID
-  )[0];
-}
-
-function generatePositionRequestPda(position: PublicKey, counter: number) {
-  return PublicKey.findProgramAddressSync(
-    [
-      Buffer.from("position_request"),
-      position.toBuffer(),
-      Buffer.from(Uint8Array.of(counter)),
-    ],
-    PERPS_ID
-  )[0];
-}
+// Need a wrapped‑SOL ATA that lives *under the positionRequest PDA*
+const fundingAccount = getAssociatedTokenAddressSync(
+  mintUSDC,
+  keypair.publicKey,
+  true
+);
 
 // ─────────────────────────────────────────────────────────────────────────
 //  OPEN position                                                          ─
@@ -84,21 +90,26 @@ export async function openPerpPosition(params: {
   } = params;
 
   // basic inputs
-  const owner          = keypair.publicKey;
-  const counter        = Math.floor(Math.random() * 1e6);
-  const sizeUsdDelta   = new BN(sizeUsd * 1e6);            // USDC 6 decimals
-  const collateralDelta= new BN(collateralSol);
+  const owner = keypair.publicKey;
+  const sizeUsdDelta = new BN(sizeUsd * 1e6);            // USDC 6 decimals
+  const collateralDelta = new BN(collateralSol);
 
   // derive PDAs
-  const positionPda        = generatePositionPda(owner, SOL_CUSTODY);
-  const positionRequestPda = generatePositionRequestPda(positionPda, counter);
+  // #7 - Position
+  const { position: positionPda } = generatePositionPda({
+    custody: CUSTODY,
+    collateralCustody: COLLATERAL_USDC_CUSTODY,
+    walletAddress: keypair.publicKey,
+    side,
+  });
 
-  // Need a wrapped‑SOL ATA that lives *under the positionRequest PDA*
-  const fundingAccount = getAssociatedTokenAddressSync(
-    NATIVE_MINT,
-    positionRequestPda,
-    true
-  );
+  const { positionRequest, counter } = generatePositionRequestPda({
+    positionPubkey: positionPda,
+    requestChange: "increase",
+  });
+
+  const positionRequestAta = getAssociatedTokenAddressSync(mintUSDC, positionRequest, true);
+
 
   // Quoting – only needed when the trade requires a swap (SOL→SOL doesn't),
   // but I include the pattern for completeness.
@@ -110,24 +121,24 @@ export async function openPerpPosition(params: {
   );
 
   // — Build instruction list —
-  const preIxs  = [
+  const preIxs = [
     // create wSOL ATA
     createAssociatedTokenAccountIdempotentInstruction(
       owner,
       fundingAccount,
-      positionRequestPda,
-      NATIVE_MINT
+      positionRequest,
+      mintUSDC
     ),
     SystemProgram.transfer({
       fromPubkey: owner,
-      toPubkey:   fundingAccount,
-      lamports:   BigInt(collateralDelta.toString()),
+      toPubkey: fundingAccount,
+      lamports: BigInt(collateralDelta.toString()),
     }),
     createSyncNativeInstruction(fundingAccount),
   ];
   const increaseIx = await PROGRAM.methods
     .createIncreasePositionMarketRequest({
-      counter: new BN(counter),
+      counter,
       collateralTokenDelta: collateralDelta,
       jupiterMinimumOut,
       priceSlippage,
@@ -137,18 +148,15 @@ export async function openPerpPosition(params: {
     .accounts({
       // mandatory accounts
       owner,
-      pool: POOL_ID,
+      pool: JLP_POOL_ACCOUNT_PUBKEY,
       position: positionPda,
-      positionRequest: positionRequestPda,
-      positionRequestAta: fundingAccount,
-      custody:          SOL_CUSTODY,
-      collateralCustody: SOL_CUSTODY,
+      positionRequest,
+      positionRequestAta,
+      custody: CUSTODY,
+      collateralCustody: COLLATERAL_USDC_CUSTODY,
       fundingAccount,
-      inputMint: NATIVE_MINT,
-      perpetuals: PublicKey.findProgramAddressSync(
-        [Buffer.from("perpetuals")],
-        PERPS_ID
-      )[0],
+      inputMint: mintUSDC,
+      perpetuals,
       referral: null,
     })
     .instruction();
@@ -161,7 +169,7 @@ export async function openPerpPosition(params: {
     instructions: preIxs.concat(increaseIx),
   }).compileToV0Message();
   const simTx = new VersionedTransaction(simMessage);
-  const sim   = await connection.simulateTransaction(simTx, {
+  const sim = await connection.simulateTransaction(simTx, {
     replaceRecentBlockhash: true,
     sigVerify: false,
   });
@@ -192,51 +200,50 @@ export async function openPerpPosition(params: {
 // ─────────────────────────────────────────────────────────────────────────
 //  CLOSE (full)                                                           ─
 export async function closePerpPosition(positionPda: PublicKey) {
-  const position     = await PROGRAM.account.position.fetch(positionPda);
-  const counter      = Math.floor(Math.random() * 1e6);
-  const positionReq  = generatePositionRequestPda(positionPda, counter);
+  const position = await PROGRAM.account.position.fetch(positionPda);
+
+  if (!position || position.sizeUsd.isZero()) {
+    console.error("❌ Empty position!");
+    return;
+  }
+
+  const { positionRequest, counter } = generatePositionRequestPda({
+    positionPubkey: positionPda,
+    requestChange: "decrease",
+  });
 
   // choose which token you want back; here we redeem as SOL
-  const desiredMint  = NATIVE_MINT;
-  const receivingATA = getAssociatedTokenAddressSync(
-    desiredMint,
-    position.owner,
-    true
-  );
+  const desiredMint = mintUSDC;
+  const positionRequestAta = getAssociatedTokenAddressSync(desiredMint, positionRequest, true);
+
+
   const decIx = await PROGRAM.methods
     .createDecreasePositionMarketRequest({
       collateralUsdDelta: new BN(0),
-      sizeUsdDelta:       new BN(0),
-      priceSlippage:      new BN(100_000_000_000), // generous
-      jupiterMinimumOut:  null,
+      sizeUsdDelta: new BN(0),
+      priceSlippage: new BN(10_000_000_000), // 1% slippage
+      jupiterMinimumOut: null,
       counter: new BN(counter),
-      entirePosition:     true,
+      entirePosition: true,
     })
     .accounts({
-      owner: position.owner,
-      pool:  POOL_ID,
+      owner: keypair.publicKey,
+      pool: JLP_POOL_ACCOUNT_PUBKEY,
       position: positionPda,
-      positionRequest: positionReq,
-      positionRequestAta: getAssociatedTokenAddressSync(
-        desiredMint,
-        positionReq,
-        true
-      ),
-      custody: position.custody,
-      collateralCustody: position.collateralCustody,
+      positionRequest,
+      positionRequestAta,
+      custody: CUSTODY,
+      collateralCustody: COLLATERAL_USDC_CUSTODY,
       desiredMint,
-      receivingAccount: receivingATA,
-      perpetuals: PublicKey.findProgramAddressSync(
-        [Buffer.from("perpetuals")],
-        PERPS_ID
-      )[0],
+      receivingAccount: fundingAccount,
+      perpetuals,
       referral: null,
     })
     .instruction();
 
-  const bh  = (await connection.getLatestBlockhash()).blockhash;
+  const bh = (await connection.getLatestBlockhash()).blockhash;
   const msg = new TransactionMessage({
-    payerKey: position.owner,
+    payerKey: keypair.publicKey,
     recentBlockhash: bh,
     instructions: [
       ComputeBudgetProgram.setComputeUnitLimit({ units: 1_200_000 }),
@@ -260,18 +267,24 @@ export async function closePerpPosition(positionPda: PublicKey) {
   console.log("using wallet: ", keypair.publicKey.toBase58());
 
   console.log("Opening position...");
-  
+
   const sig = await openPerpPosition({
     side: "long",
-    sizeUsd: 100,
+    sizeUsd: 5,
     collateralSol: 0.1 * 1e9, // lamports
   });
 
   console.log("Position opened with signature: ", sig);
-  
+
   console.log("Closing position...");
   // wait a few seconds then close the exact same position
   // (you'd normally fetch the PDA list first)
-  const posPda = generatePositionPda(keypair.publicKey, SOL_CUSTODY);
-  await closePerpPosition(posPda);
+  const { position: positionPda } = generatePositionPda({
+    custody: CUSTODY,
+    collateralCustody: COLLATERAL_USDC_CUSTODY,
+    walletAddress: keypair.publicKey,
+    side: "long",
+  });
+
+  await closePerpPosition(positionPda);
 })();
