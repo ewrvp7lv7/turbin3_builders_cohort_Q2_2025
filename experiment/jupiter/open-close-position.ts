@@ -115,10 +115,17 @@ export async function openPerpPosition(params: {
   // but I include the pattern for completeness.
   const jupiterMinimumOut = null; // leave null for native SOL longs
 
-  // Slippage in quote units (USDC 6dp)
+  // wrong! Slippage in quote units (USDC 6dp)
   const priceSlippage = new BN(
     (maxPriceSlippagePct / 100) * 1e6 * 1 // $1 in quote units
   );
+
+  // priceSlippage **increase** position should be less for long positions and greater for shorts
+  // priceSlippage based on current price (SOL/USD price, for example)
+  // const priceSlippage = price * 101 / 100; // 1% slippage for long
+  // const priceSlippage = price * 99 / 100; // 1% slippage for short
+
+
 
   // — Build instruction list —
   const preIxs = [
@@ -216,6 +223,14 @@ export async function closePerpPosition(positionPda: PublicKey) {
   const desiredMint = mintUSDC;
   const positionRequestAta = getAssociatedTokenAddressSync(desiredMint, positionRequest, true);
 
+
+    // wrong!
+    const priceSlippage = new BN(10_000_000_000);
+  
+    // priceSlippage for **decrease** position should be greater for long positions and less for shorts
+    // priceSlippage based on current price (SOL/USD price, for example)
+    // const priceSlippage = price * 99 / 100; // 1% slippage for long
+    // const priceSlippage = price * 101 / 100; // 1% slippage for short
 
   const decIx = await PROGRAM.methods
     .createDecreasePositionMarketRequest({
